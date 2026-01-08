@@ -1177,10 +1177,25 @@ vtophys_iommu_map_dma_bar(uint64_t vaddr, uint64_t iova, uint64_t size)
 }
 
 static int
-_vfio_iommu_unmap_dma(struct spdk_vfio_dma_map *dma_map)
+_vfio_iommu_unmap_dma(uint64_t iova, uint64_t size)
 {
+	struct spdk_vfio_dma_map *dma_map;
 	struct vfio_iommu_type1_dma_unmap unmap = {};
 	int ret;
+
+	TAILQ_FOREACH(dma_map, &g_vfio.maps, tailq) {
+		if (dma_map->map.iova == iova) {
+			break;
+		}
+	}
+
+	if (dma_map == NULL) {
+		DEBUG_PRINT("Cannot clear DMA mapping for IOVA %"PRIx64" - it's not mapped\n", iova);
+		return -ENXIO;
+	}
+
+	/** don't support partial or multiple-page unmap for now */
+	assert(dma_map->map.size == size);
 
 	if (g_vfio.device_ref == 0) {
 		/* Memory is not mapped anymore, just remove it's references */
@@ -1205,22 +1220,10 @@ out_remove:
 static int
 vtophys_iommu_unmap_dma(uint64_t iova, uint64_t size)
 {
-	struct spdk_vfio_dma_map *dma_map;
 	uint64_t refcount;
 	int ret;
 
 	pthread_mutex_lock(&g_vfio.mutex);
-	TAILQ_FOREACH(dma_map, &g_vfio.maps, tailq) {
-		if (dma_map->map.iova == iova) {
-			break;
-		}
-	}
-
-	if (dma_map == NULL) {
-		DEBUG_PRINT("Cannot clear DMA mapping for IOVA %"PRIx64" - it's not mapped\n", iova);
-		pthread_mutex_unlock(&g_vfio.mutex);
-		return -ENXIO;
-	}
 
 	refcount = spdk_mem_map_translate(g_phys_ref_map, iova, NULL);
 	assert(refcount < UINT64_MAX);
@@ -1234,10 +1237,7 @@ vtophys_iommu_unmap_dma(uint64_t iova, uint64_t size)
 		return 0;
 	}
 
-	/** don't support partial or multiple-page unmap for now */
-	assert(dma_map->map.size == size);
-
-	ret = _vfio_iommu_unmap_dma(dma_map);
+	ret = _vfio_iommu_unmap_dma(iova, size);
 	pthread_mutex_unlock(&g_vfio.mutex);
 
 	return ret;
@@ -1262,7 +1262,7 @@ vtophys_iommu_unmap_dma_bar(uint64_t vaddr)
 		return -ENXIO;
 	}
 
-	ret = _vfio_iommu_unmap_dma(dma_map);
+	ret = _vfio_iommu_unmap_dma(dma_map->map.iova, dma_map->map.size);
 	pthread_mutex_unlock(&g_vfio.mutex);
 	return ret;
 }

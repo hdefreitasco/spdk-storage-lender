@@ -1389,6 +1389,10 @@ typedef int (*spdk_mem_map_notify_cb)(void *cb_ctx, struct spdk_mem_map *map,
 				      enum spdk_mem_map_notify_action action,
 				      void *vaddr, size_t size);
 
+typedef int (*spdk_mem_map_dma_buf_notify_cb)(void *cb_ctx, struct spdk_mem_map *map,
+		enum spdk_mem_map_notify_action action,
+		int dma_buf, uint64_t offset, void *iova, size_t len);
+
 typedef int (*spdk_mem_map_contiguous_translations)(uint64_t addr_1, uint64_t addr_2);
 
 /**
@@ -1396,6 +1400,7 @@ typedef int (*spdk_mem_map_contiguous_translations)(uint64_t addr_1, uint64_t ad
  */
 struct spdk_mem_map_ops {
 	spdk_mem_map_notify_cb notify_cb;
+	spdk_mem_map_dma_buf_notify_cb dma_buf_notify_cb;
 	spdk_mem_map_contiguous_translations are_contiguous;
 };
 
@@ -1473,6 +1478,27 @@ uint64_t spdk_mem_map_translate(const struct spdk_mem_map *map, uint64_t vaddr, 
  * \return 0 on success, negative errno on failure.
  */
 int spdk_mem_register(void *vaddr, size_t len);
+
+/**
+ * Register a DMA-BUF for address translation.
+ *
+ * This function registers a Linux DMA-BUF (represented by a file descriptor)
+ * with SPDK's memory management system. The DMA-BUF will be mapped into the
+ * IOMMU using IOMMUFD, allowing SPDK devices to access the memory.
+ *
+ * This function requires IOMMUFD DMA-BUF support (Linux kernel 6.13+) and
+ * will fail if it is not available.
+ *
+ * Memory can be unregistered by passing the iova to spdk_mem_unregister().
+ *
+ * \param dma_buf dma_buf fd obtained from a kernel service
+ * \param offset Byte offset into the dma_buf to start the mapping from.
+ * \param iova I/O virtual address to register.
+ * \param len Length in bytes of the vaddr.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, void *iova, size_t len);
 
 /**
  * Unregister the specified memory region from vtophys address translation.

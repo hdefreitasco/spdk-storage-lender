@@ -34,6 +34,11 @@
 #else
 #define IOMMUFD_ENABLED 0
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#define IOMMUFD_MAP_FILE_ENABLED 1
+#else
+#define IOMMUFD_MAP_FILE_ENABLED 0
+#endif
 #include <rte_vfio.h>
 
 struct spdk_vfio_dma_map {
@@ -524,6 +529,56 @@ spdk_mem_register(void *vaddr, size_t len)
 		rc = map->ops.notify_cb(map->cb_ctx, map, SPDK_MEM_MAP_NOTIFY_REGISTER, vaddr, len);
 		if (rc != 0) {
 			DEBUG_PRINT("failed to register vaddr %p to map %p, rc = %d\n", vaddr, map, rc);
+		}
+	}
+
+	pthread_mutex_unlock(&g_spdk_mem_map_mutex);
+	return 0;
+}
+
+int
+spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, void *iova, size_t len)
+{
+	struct spdk_mem_map *map;
+	int rc, page = 0;
+
+	if ((uintptr_t)iova & ~MASK_256TB) {
+		DEBUG_PRINT("invalid usermode virtual address %p\n", iova);
+		return -EINVAL;
+	}
+
+	if (((uintptr_t)iova & MASK_4KB) || (len & MASK_4KB)) {
+		DEBUG_PRINT("invalid %s parameters, iova=%p len=%ju\n",
+			    __func__, iova, len);
+		return -EINVAL;
+	}
+
+	if (len == 0) {
+		return 0;
+	}
+
+	pthread_mutex_lock(&g_spdk_mem_map_mutex);
+	rc = mem_map_walk_region(g_mem_reg_map, (uint64_t)iova, len,
+				 mem_check_region_unregistered, NULL);
+	if (rc != 0) {
+		pthread_mutex_unlock(&g_spdk_mem_map_mutex);
+		return rc;
+	}
+
+	rc = mem_map_walk_region(g_mem_reg_map, (uint64_t)iova, len,
+				 mem_register_page, &page);
+	if (rc != 0) {
+		pthread_mutex_unlock(&g_spdk_mem_map_mutex);
+		return rc;
+	}
+
+	TAILQ_FOREACH(map, &g_spdk_mem_maps, tailq) {
+		if (map->ops.dma_buf_notify_cb) {
+			rc = map->ops.dma_buf_notify_cb(map->cb_ctx, map, SPDK_MEM_MAP_NOTIFY_REGISTER,
+							dma_buf, offset, iova, len);
+			if (rc != 0) {
+				DEBUG_PRINT("failed to register dma_buf %d to map %p, rc = %d\n", dma_buf, map, rc);
+			}
 		}
 	}
 
@@ -1673,6 +1728,128 @@ vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 	return rc;
 }
 
+#if IOMMUFD_MAP_FILE_ENABLED
+static int
+vtophys_map_identity(struct spdk_mem_map *map, uint64_t vaddr, size_t len, void *ctx)
+{
+	spdk_mem_map_set_translation(map, vaddr, len, vaddr);
+	return 0;
+}
+#endif
+
+static int
+vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
+		       enum spdk_mem_map_notify_action action,
+		       int dma_buf, uint64_t offset, void *iova, size_t len)
+{
+#if IOMMUFD_MAP_FILE_ENABLED
+	int rc = 0;
+
+	if (!spdk_iommu_is_enabled()) {
+		DEBUG_PRINT("DMA-BUF registration requires IOMMU to be enabled\n");
+		return -ENOTSUP;
+	}
+
+	if (g_vfio.ioas_id == 0) {
+		DEBUG_PRINT("DMA-BUF registration requires IOMMUFD (not legacy VFIO)\n");
+		return -ENOTSUP;
+	}
+
+	if (rte_eal_iova_mode() != RTE_IOVA_VA) {
+		DEBUG_PRINT("DMA-BUF registration requires IOVA=VA mode\n");
+		return -ENOTSUP;
+	}
+
+	if ((uintptr_t)iova & ~MASK_256TB) {
+		DEBUG_PRINT("invalid IOVA address %p\n", iova);
+		return -EINVAL;
+	}
+
+	if (((uintptr_t)iova & MASK_4KB) || (len & MASK_4KB)) {
+		DEBUG_PRINT("invalid parameters, iova=%p len=%ju\n", iova, len);
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&g_vfio.mutex);
+
+	switch (action) {
+	case SPDK_MEM_MAP_NOTIFY_REGISTER: {
+		struct iommu_ioas_map_file map_file = {
+			.size = sizeof(map_file),
+			.flags = IOMMU_IOAS_MAP_FIXED_IOVA | IOMMU_IOAS_MAP_WRITEABLE | IOMMU_IOAS_MAP_READABLE,
+			.ioas_id = g_vfio.ioas_id,
+			.fd = dma_buf,
+			.start = offset,
+			.length = len,
+			.iova = (uint64_t)iova,
+		};
+
+		rc = ioctl(g_vfio.fd, IOMMU_IOAS_MAP_FILE, &map_file);
+		if (rc != 0) {
+			DEBUG_PRINT("IOMMUFD map DMA-BUF failed: fd=%d offset=%"PRIu64" iova=%p len=%zu error=%d (%s)\n",
+				    dma_buf, offset, iova, len, errno, strerror(errno));
+			rc = -errno;
+			goto out;
+		}
+
+		/* Update vtophys map with identity mapping */
+		rc = vtophys_walk_region(map, iova, len, vtophys_map_identity);
+		if (rc != 0) {
+			/* Rollback the IOMMUFD mapping */
+			struct iommu_ioas_unmap unmap = {
+				.size = sizeof(unmap),
+				.ioas_id = g_vfio.ioas_id,
+				.iova = (uint64_t)iova,
+				.length = len,
+			};
+			ioctl(g_vfio.fd, IOMMU_IOAS_UNMAP, &unmap);
+			DEBUG_PRINT("Failed to update vtophys map for DMA-BUF\n");
+			goto out;
+		}
+
+		DEBUG_PRINT("Registered DMA-BUF: fd=%d offset=%"PRIu64" iova=%p len=%zu\n",
+			    dma_buf, offset, iova, len);
+		break;
+	}
+	case SPDK_MEM_MAP_NOTIFY_UNREGISTER: {
+		struct iommu_ioas_unmap unmap = {
+			.size = sizeof(unmap),
+			.ioas_id = g_vfio.ioas_id,
+			.iova = (uint64_t)iova,
+			.length = len,
+		};
+
+		rc = ioctl(g_vfio.fd, IOMMU_IOAS_UNMAP, &unmap);
+		if (rc != 0) {
+			DEBUG_PRINT("IOMMUFD unmap DMA-BUF failed: iova=%p len=%zu error=%d (%s)\n",
+				    iova, len, errno, strerror(errno));
+			rc = -errno;
+			goto out;
+		}
+
+		/* Clear vtophys map */
+		rc = vtophys_walk_region(map, iova, len, vtophys_unmap_page);
+		if (rc != 0) {
+			DEBUG_PRINT("Failed to clear vtophys map for DMA-BUF\n");
+			goto out;
+		}
+
+		DEBUG_PRINT("Unregistered DMA-BUF: iova=%p len=%zu\n", iova, len);
+		break;
+	}
+	default:
+		SPDK_UNREACHABLE();
+	}
+
+out:
+	pthread_mutex_unlock(&g_vfio.mutex);
+	return rc;
+#else
+	DEBUG_PRINT("DMA-BUF registration requires Linux kernel 6.13+ with IOMMUFD MAP_FILE support\n");
+	return -ENOTSUP;
+#endif
+}
+
 static int
 numa_notify(void *cb_ctx, struct spdk_mem_map *map,
 	    enum spdk_mem_map_notify_action action,
@@ -1958,6 +2135,7 @@ vtophys_init(void)
 {
 	const struct spdk_mem_map_ops vtophys_map_ops = {
 		.notify_cb = vtophys_notify,
+		.dma_buf_notify_cb = vtophys_dma_buf_notify,
 		.are_contiguous = vtophys_check_contiguous_entries,
 	};
 

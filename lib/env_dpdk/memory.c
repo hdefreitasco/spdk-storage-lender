@@ -1096,6 +1096,23 @@ static struct spdk_mem_map *g_numa_map;
 static int
 _vfio_iommu_map_dma(uint64_t vaddr, uint64_t iova, uint64_t size)
 {
+#if IOMMUFD_ENABLED
+	/* Use IOMMUFD if available */
+	if (g_vfio.ioas_id != 0) {
+		struct iommu_ioas_map ioas_map = {
+			.size = sizeof(ioas_map),
+			.flags = IOMMU_IOAS_MAP_FIXED_IOVA | IOMMU_IOAS_MAP_WRITEABLE | IOMMU_IOAS_MAP_READABLE,
+			.ioas_id = g_vfio.ioas_id,
+			.user_va = vaddr,
+			.length = size,
+			.iova = iova,
+		};
+
+		return ioctl(g_vfio.fd, IOMMU_IOAS_MAP, &ioas_map);
+	}
+#endif
+
+	/* Legacy VFIO path */
 	struct spdk_vfio_dma_map *dma_map;
 	int ret;
 
@@ -1179,6 +1196,21 @@ vtophys_iommu_map_dma_bar(uint64_t vaddr, uint64_t iova, uint64_t size)
 static int
 _vfio_iommu_unmap_dma(uint64_t iova, uint64_t size)
 {
+#if IOMMUFD_ENABLED
+	/* Use IOMMUFD if available */
+	if (g_vfio.ioas_id != 0) {
+		struct iommu_ioas_unmap ioas_unmap = {
+			.size = sizeof(ioas_unmap),
+			.ioas_id = g_vfio.ioas_id,
+			.iova = iova,
+			.length = size,
+		};
+
+		return ioctl(g_vfio.fd, IOMMU_IOAS_UNMAP, &ioas_unmap);
+	}
+#endif
+
+	/* Legacy VFIO path */
 	struct spdk_vfio_dma_map *dma_map;
 	struct vfio_iommu_type1_dma_unmap unmap = {};
 	int ret;

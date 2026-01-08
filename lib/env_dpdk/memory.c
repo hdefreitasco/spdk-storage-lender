@@ -28,6 +28,12 @@
 #include <linux/version.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 6, 0)
 #include <linux/vfio.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#include <linux/iommufd.h>
+#define IOMMUFD_ENABLED 1
+#else
+#define IOMMUFD_ENABLED 0
+#endif
 #include <rte_vfio.h>
 
 struct spdk_vfio_dma_map {
@@ -39,6 +45,9 @@ struct vfio_cfg {
 	int fd;
 	bool enabled;
 	bool noiommu_enabled;
+#if IOMMUFD_ENABLED
+	uint32_t ioas_id;
+#endif
 	unsigned device_ref;
 	TAILQ_HEAD(, spdk_vfio_dma_map) maps;
 	pthread_mutex_t mutex;
@@ -48,6 +57,9 @@ static struct vfio_cfg g_vfio = {
 	.fd = -1,
 	.enabled = false,
 	.noiommu_enabled = false,
+#if IOMMUFD_ENABLED
+	.ioas_id = 0,
+#endif
 	.device_ref = 0,
 	.maps = TAILQ_HEAD_INITIALIZER(g_vfio.maps),
 	.mutex = PTHREAD_MUTEX_INITIALIZER
@@ -1710,14 +1722,39 @@ vfio_noiommu_enabled(void)
 	return rte_vfio_noiommu_is_enabled();
 }
 
+#if IOMMUFD_ENABLED
+static int
+vtophys_iommufd_get_ioas_id(void)
+{
+	struct iommu_vfio_ioas vfio_ioas = {
+		.size = sizeof(vfio_ioas),
+		.op = IOMMU_VFIO_IOAS_GET,
+	};
+
+	if (ioctl(g_vfio.fd, IOMMU_VFIO_IOAS, &vfio_ioas) == 0) {
+		g_vfio.ioas_id = vfio_ioas.ioas_id;
+		DEBUG_PRINT("Using IOMMUFD with VFIO compatibility IOAS ID: %u\n", g_vfio.ioas_id);
+		return 0;
+	}
+
+	DEBUG_PRINT("IOMMU_VFIO_IOAS ioctl failed, assuming legacy VFIO: %d (%s)\n",
+		    errno, strerror(errno));
+	return -errno;
+}
+#endif
+
 static void
 vtophys_iommu_init(void)
 {
 	char proc_fd_path[PATH_MAX + 1];
 	char link_path[PATH_MAX + 1];
 	const char vfio_path[] = "/dev/vfio/vfio";
+#if IOMMUFD_ENABLED
+	const char iommufd_path[] = "/dev/iommu";
+#endif
 	DIR *dir;
 	struct dirent *d;
+	ssize_t link_len;
 
 	if (!vfio_enabled()) {
 		return;
@@ -1741,12 +1778,32 @@ vtophys_iommu_init(void)
 		}
 
 		snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/self/fd/%s", d->d_name);
-		if (readlink(proc_fd_path, link_path, sizeof(link_path)) != (sizeof(vfio_path) - 1)) {
+		link_len = readlink(proc_fd_path, link_path, sizeof(link_path));
+		if (link_len < 0) {
 			continue;
 		}
 
-		if (memcmp(link_path, vfio_path, sizeof(vfio_path) - 1) == 0) {
+#if IOMMUFD_ENABLED
+		/* Check for IOMMUFD first (preferred) */
+		if (link_len == (ssize_t)sizeof(iommufd_path) - 1 &&
+		    memcmp(link_path, iommufd_path, link_len) == 0) {
 			sscanf(d->d_name, "%d", &g_vfio.fd);
+			DEBUG_PRINT("Discovered IOMMUFD fd %d at %s\n", g_vfio.fd, iommufd_path);
+
+			if (vtophys_iommufd_get_ioas_id() != 0) {
+				DEBUG_PRINT("Failed to get IOAS ID from IOMMUFD fd %d, continuing search\n", g_vfio.fd);
+				g_vfio.fd = -1;
+				continue;
+			}
+
+			break;
+		}
+#endif
+
+		if (link_len == (ssize_t)sizeof(vfio_path) - 1 &&
+		    memcmp(link_path, vfio_path, link_len) == 0) {
+			sscanf(d->d_name, "%d", &g_vfio.fd);
+			DEBUG_PRINT("Discovered VFIO container fd %d at %s\n", g_vfio.fd, vfio_path);
 			break;
 		}
 	}
@@ -1754,7 +1811,7 @@ vtophys_iommu_init(void)
 	closedir(dir);
 
 	if (g_vfio.fd < 0) {
-		DEBUG_PRINT("Failed to discover DPDK VFIO container fd.\n");
+		DEBUG_PRINT("Failed to discover DPDK VFIO container or IOMMUFD fd.\n");
 		return;
 	}
 

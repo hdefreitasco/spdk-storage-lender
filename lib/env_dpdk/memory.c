@@ -1698,12 +1698,6 @@ vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 				 */
 				if (iova_mode == RTE_IOVA_VA) {
 					paddr = spdk_vtophys(va, &buffer_len);
-					if (buffer_len != len || paddr != (uintptr_t)va) {
-						DEBUG_PRINT("Unmapping %p with length %lu failed because "
-							    "translation had address 0x%" PRIx64 " and length %lu\n",
-							    va, len, paddr, buffer_len);
-						return -EINVAL;
-					}
 					rc = vtophys_iommu_unmap_dma(paddr, len);
 					if (rc) {
 						DEBUG_PRINT("Failed to iommu unmap paddr 0x%" PRIx64 "\n", paddr);
@@ -1737,6 +1731,9 @@ vtophys_map_identity(struct spdk_mem_map *map, uint64_t vaddr, size_t len, void 
 }
 #endif
 
+static void
+vtophys_iommu_init(void);
+
 static int
 vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
 		       enum spdk_mem_map_notify_action action,
@@ -1744,6 +1741,12 @@ vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
 {
 #if IOMMUFD_MAP_FILE_ENABLED
 	int rc = 0;
+	static bool first = true;
+
+	if (first) {
+		vtophys_iommu_init();
+		first = false;
+	}
 
 	if (!spdk_iommu_is_enabled()) {
 		DEBUG_PRINT("DMA-BUF registration requires IOMMU to be enabled\n");

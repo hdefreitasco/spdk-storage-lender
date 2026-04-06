@@ -1391,7 +1391,7 @@ typedef int (*spdk_mem_map_notify_cb)(void *cb_ctx, struct spdk_mem_map *map,
 
 typedef int (*spdk_mem_map_dma_buf_notify_cb)(void *cb_ctx, struct spdk_mem_map *map,
 		enum spdk_mem_map_notify_action action,
-		int dma_buf, uint64_t offset, void *iova, size_t len);
+		int dma_buf, uint64_t offset, uint64_t *iova, size_t len);
 
 typedef int (*spdk_mem_map_contiguous_translations)(uint64_t addr_1, uint64_t addr_2);
 
@@ -1498,7 +1498,7 @@ int spdk_mem_register(void *vaddr, size_t len);
  *
  * \return 0 on success, negative errno on failure.
  */
-int spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, void *iova, size_t len);
+int spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, uint64_t *iova, size_t len);
 
 /**
  * Unregister the specified memory region from vtophys address translation.

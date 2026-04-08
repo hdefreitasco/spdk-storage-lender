@@ -1489,16 +1489,29 @@ int spdk_mem_register(void *vaddr, size_t len);
  * This function requires IOMMUFD DMA-BUF support (Linux kernel 6.13+) and
  * will fail if it is not available.
  *
- * Memory can be unregistered by passing the iova to spdk_mem_unregister().
+ * Memory can be unregistered via spdk_mem_unregister_dma_buf().
  *
- * \param dma_buf dma_buf fd obtained from a kernel service
+ * \param dma_buf dma_buf fd obtained from a kernel service.
  * \param offset Byte offset into the dma_buf to start the mapping from.
- * \param iova I/O virtual address to register.
- * \param len Length in bytes of the vaddr.
+ * \param iova On success, the IOVA assigned by the IOMMU is written here.
+ * \param len Length in bytes of the DMA-BUF region to register.
  *
  * \return 0 on success, negative errno on failure.
  */
 int spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, uint64_t *iova, size_t len);
+
+/**
+ * Unregister a previously registered DMA-BUF from address translation.
+ *
+ * The caller must ensure all in-flight DMA operations to this memory region
+ * are completed or cancelled before calling this function.
+ *
+ * \param iova I/O virtual address value that was assigned during registration.
+ * \param len Length in bytes that was registered.
+ *
+ * \return 0 on success, negative errno on failure.
+ */
+int spdk_mem_unregister_dma_buf(uint64_t iova, size_t len);
 
 /**
  * Unregister the specified memory region from vtophys address translation.

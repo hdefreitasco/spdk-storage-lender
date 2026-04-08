@@ -1238,6 +1238,119 @@ test_mem_4kb_register_create(void)
 	g_vaddr_to_fail = (void *)UINT64_MAX;
 }
 
+struct ut_dma_buf_reg {
+	int			dma_buf;
+	uint64_t		offset;
+	uint64_t		iova;
+	size_t			len;
+	bool			registered;
+	TAILQ_ENTRY(ut_dma_buf_reg) tailq;
+};
+
+TAILQ_HEAD(ut_dma_buf_reg_tailq, ut_dma_buf_reg);
+
+static int
+test_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
+		    enum spdk_mem_map_notify_action action,
+		    int dma_buf, uint64_t offset, uint64_t *iova, size_t len)
+{
+	struct ut_dma_buf_reg_tailq *regs = cb_ctx;
+	struct ut_dma_buf_reg *reg;
+
+	switch (action) {
+	case SPDK_MEM_MAP_NOTIFY_REGISTER:
+		reg = calloc(1, sizeof(*reg));
+		SPDK_CU_ASSERT_FATAL(reg != NULL);
+		reg->dma_buf = dma_buf;
+		reg->offset = offset;
+		reg->iova = (uint64_t)rand() << 32 | (uint64_t)rand();
+		reg->len = len;
+		reg->registered = true;
+		*iova = reg->iova;
+		TAILQ_INSERT_TAIL(regs, reg, tailq);
+		break;
+	case SPDK_MEM_MAP_NOTIFY_UNREGISTER:
+		TAILQ_FOREACH(reg, regs, tailq) {
+			if (reg->iova == *iova && reg->len == len) {
+				break;
+			}
+		}
+		SPDK_CU_ASSERT_FATAL(reg != NULL);
+		TAILQ_REMOVE(regs, reg, tailq);
+		free(reg);
+		break;
+	default:
+		SPDK_UNREACHABLE();
+	}
+
+	return 0;
+}
+
+static int
+ut_dma_buf_reg_count(struct ut_dma_buf_reg_tailq *regs)
+{
+	struct ut_dma_buf_reg *reg;
+	int count = 0;
+
+	TAILQ_FOREACH(reg, regs, tailq) {
+		count++;
+	}
+	return count;
+}
+
+static void
+test_mem_dma_buf_registration(void)
+{
+	struct spdk_mem_map *map;
+	uint64_t default_translation = 0xDEADBEEF0BADF00D;
+	struct ut_dma_buf_reg_tailq regs;
+	uint64_t iova1 = 0, iova2 = 0;
+	int rc;
+
+	struct spdk_mem_map_ops dma_buf_ops = {
+		.notify_cb = test_mem_map_notify_nop,
+		.dma_buf_notify_cb = test_dma_buf_notify,
+		.are_contiguous = NULL
+	};
+
+	TAILQ_INIT(&regs);
+
+	map = spdk_mem_map_alloc(default_translation, &dma_buf_ops, &regs);
+	SPDK_CU_ASSERT_FATAL(map != NULL);
+
+	/* Register a dma_buf */
+	rc = spdk_mem_register_dma_buf(42, 0, &iova1, 4096);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_dma_buf_reg_count(&regs) == 1);
+
+	/* Register a second dma_buf */
+	rc = spdk_mem_register_dma_buf(43, 0, &iova2, 8192);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_dma_buf_reg_count(&regs) == 2);
+
+	/* Unregister the first dma_buf */
+	rc = spdk_mem_unregister_dma_buf(iova1, 4096);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_dma_buf_reg_count(&regs) == 1);
+
+	/* Unregister the second dma_buf */
+	rc = spdk_mem_unregister_dma_buf(iova2, 8192);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_dma_buf_reg_count(&regs) == 0);
+
+	/* Register and unregister with len=0 should be no-ops */
+	rc = spdk_mem_register_dma_buf(44, 0, &iova1, 0);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_dma_buf_reg_count(&regs) == 0);
+
+	rc = spdk_mem_unregister_dma_buf(iova1, 0);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(ut_dma_buf_reg_count(&regs) == 0);
+
+	spdk_mem_map_free(&map);
+	CU_ASSERT(map == NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1274,7 +1387,8 @@ main(int argc, char **argv)
 		CU_add_test(suite, "mem_map_4kb", test_mem_map_4kb) == NULL ||
 		CU_add_test(suite, "mem_map_4kb_contig_pages", test_mem_map_4kb_contig_pages) == NULL ||
 		CU_add_test(suite, "mem_4kb_register_notify", test_mem_4kb_register_notify) == NULL ||
-		CU_add_test(suite, "mem_4kb_register_create", test_mem_4kb_register_create) == NULL
+		CU_add_test(suite, "mem_4kb_register_create", test_mem_4kb_register_create) == NULL ||
+		CU_add_test(suite, "mem_dma_buf_registration", test_mem_dma_buf_registration) == NULL
 	) {
 		CU_cleanup_registry();
 		return CU_get_error();

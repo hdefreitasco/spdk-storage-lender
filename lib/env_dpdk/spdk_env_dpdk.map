@@ -118,6 +118,7 @@
 	spdk_mem_map_translate;
 	spdk_mem_register;
 	spdk_mem_register_dma_buf;
+	spdk_mem_unregister_dma_buf;
 	spdk_mem_unregister;
 	spdk_mem_get_fd_and_offset;
 	spdk_mem_get_numa_id;

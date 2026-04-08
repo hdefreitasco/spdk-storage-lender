@@ -540,11 +540,13 @@ int
 spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, uint64_t *iova, size_t len)
 {
 	struct spdk_mem_map *map;
-	int rc, page = 0;
+	int rc;
 
 	if (len == 0) {
 		return 0;
 	}
+
+	pthread_mutex_lock(&g_spdk_mem_map_mutex);
 
 	TAILQ_FOREACH(map, &g_spdk_mem_maps, tailq) {
 		if (map->ops.dma_buf_notify_cb) {
@@ -552,6 +554,32 @@ spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, uint64_t *iova, size_t l
 							dma_buf, offset, iova, len);
 			if (rc != 0) {
 				DEBUG_PRINT("failed to register dma_buf %d to map %p, rc = %d\n", dma_buf, map, rc);
+			}
+		}
+	}
+
+	pthread_mutex_unlock(&g_spdk_mem_map_mutex);
+	return 0;
+}
+
+int
+spdk_mem_unregister_dma_buf(uint64_t iova, size_t len)
+{
+	struct spdk_mem_map *map;
+	int rc;
+
+	if (len == 0) {
+		return 0;
+	}
+
+	pthread_mutex_lock(&g_spdk_mem_map_mutex);
+
+	TAILQ_FOREACH(map, &g_spdk_mem_maps, tailq) {
+		if (map->ops.dma_buf_notify_cb) {
+			rc = map->ops.dma_buf_notify_cb(map->cb_ctx, map, SPDK_MEM_MAP_NOTIFY_UNREGISTER,
+							-1, 0, &iova, len);
+			if (rc != 0) {
+				DEBUG_PRINT("failed to unregister iova 0x%lx from map %p, rc = %d\n", iova, map, rc);
 			}
 		}
 	}
@@ -1696,15 +1724,6 @@ vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 	return rc;
 }
 
-#if IOMMUFD_MAP_FILE_ENABLED
-static int
-vtophys_map_identity(struct spdk_mem_map *map, uint64_t vaddr, size_t len, void *ctx)
-{
-	spdk_mem_map_set_translation(map, vaddr, len, vaddr);
-	return 0;
-}
-#endif
-
 static void
 vtophys_iommu_init(void);
 
@@ -1746,7 +1765,7 @@ vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
 			.flags = IOMMU_IOAS_MAP_WRITEABLE | IOMMU_IOAS_MAP_READABLE,
 			.ioas_id = g_vfio.ioas_id,
 			.fd = dma_buf,
-			.start = 0,
+			.start = offset,
 			.length = len,
 		};
 
@@ -1768,26 +1787,19 @@ vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
 		struct iommu_ioas_unmap unmap = {
 			.size = sizeof(unmap),
 			.ioas_id = g_vfio.ioas_id,
-			.iova = (uint64_t)iova,
+			.iova = *iova,
 			.length = len,
 		};
 
 		rc = ioctl(g_vfio.fd, IOMMU_IOAS_UNMAP, &unmap);
 		if (rc != 0) {
-			DEBUG_PRINT("IOMMUFD unmap DMA-BUF failed: iova=%p len=%zu error=%d (%s)\n",
-				    iova, len, errno, strerror(errno));
+			DEBUG_PRINT("IOMMUFD unmap DMA-BUF failed: iova=0x%lx len=%zu error=%d (%s)\n",
+				    *iova, len, errno, strerror(errno));
 			rc = -errno;
 			goto out;
 		}
 
-		/* Clear vtophys map */
-		rc = vtophys_walk_region(map, iova, len, vtophys_unmap_page);
-		if (rc != 0) {
-			DEBUG_PRINT("Failed to clear vtophys map for DMA-BUF\n");
-			goto out;
-		}
-
-		DEBUG_PRINT("Unregistered DMA-BUF: iova=%p len=%zu\n", iova, len);
+		DEBUG_PRINT("Unregistered DMA-BUF: iova=0x%lx len=%zu\n", *iova, len);
 		break;
 	}
 	default:

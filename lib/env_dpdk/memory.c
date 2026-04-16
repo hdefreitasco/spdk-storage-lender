@@ -1727,6 +1727,11 @@ vtophys_notify(void *cb_ctx, struct spdk_mem_map *map,
 static void
 vtophys_iommu_init(void);
 
+#if IOMMUFD_ENABLED
+static void
+vtophys_iommufd_discover(void);
+#endif
+
 static int
 vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
 		       enum spdk_mem_map_notify_action action,
@@ -1737,17 +1742,12 @@ vtophys_dma_buf_notify(void *cb_ctx, struct spdk_mem_map *map,
 	static bool first = true;
 
 	if (first) {
-		vtophys_iommu_init();
+		vtophys_iommufd_discover();
 		first = false;
 	}
 
-	if (!spdk_iommu_is_enabled()) {
-		DEBUG_PRINT("DMA-BUF registration requires IOMMU to be enabled\n");
-		return -ENOTSUP;
-	}
-
-	if (g_vfio.ioas_id == 0) {
-		DEBUG_PRINT("DMA-BUF registration requires IOMMUFD (not legacy VFIO)\n");
+	if (g_vfio.fd < 0 || g_vfio.ioas_id == 0) {
+		DEBUG_PRINT("DMA-BUF registration requires IOMMUFD\n");
 		return -ENOTSUP;
 	}
 
@@ -1914,6 +1914,61 @@ vtophys_iommufd_get_ioas_id(void)
 	DEBUG_PRINT("IOMMU_VFIO_IOAS ioctl failed, assuming legacy VFIO: %d (%s)\n",
 		    errno, strerror(errno));
 	return -errno;
+}
+
+/* Discover the IOMMUFD fd and IOAS ID without enabling the legacy VFIO
+ * code path (g_vfio.enabled).  This is used by the DMA-BUF registration
+ * path which only needs the IOMMUFD ioctls and must not flip g_vfio.enabled
+ * after devices have already been attached — doing so would create an
+ * asymmetry where device_ref was never incremented and BARs were never
+ * tracked, leading to assertions on detach. */
+static void
+vtophys_iommufd_discover(void)
+{
+	char proc_fd_path[PATH_MAX + 1];
+	char link_path[PATH_MAX + 1];
+	const char iommufd_path[] = "/dev/iommu";
+	DIR *dir;
+	struct dirent *d;
+	ssize_t link_len;
+
+	if (g_vfio.ioas_id != 0) {
+		return;
+	}
+
+	dir = opendir("/proc/self/fd");
+	if (!dir) {
+		DEBUG_PRINT("Failed to open /proc/self/fd (%d)\n", errno);
+		return;
+	}
+
+	while ((d = readdir(dir)) != NULL) {
+		if (d->d_type != DT_LNK) {
+			continue;
+		}
+
+		snprintf(proc_fd_path, sizeof(proc_fd_path), "/proc/self/fd/%s", d->d_name);
+		link_len = readlink(proc_fd_path, link_path, sizeof(link_path));
+		if (link_len < 0) {
+			continue;
+		}
+
+		if (link_len == (ssize_t)sizeof(iommufd_path) - 1 &&
+		    memcmp(link_path, iommufd_path, link_len) == 0) {
+			sscanf(d->d_name, "%d", &g_vfio.fd);
+			DEBUG_PRINT("Discovered IOMMUFD fd %d at %s\n", g_vfio.fd, iommufd_path);
+
+			if (vtophys_iommufd_get_ioas_id() != 0) {
+				DEBUG_PRINT("Failed to get IOAS ID from IOMMUFD fd %d, continuing search\n", g_vfio.fd);
+				g_vfio.fd = -1;
+				continue;
+			}
+
+			break;
+		}
+	}
+
+	closedir(dir);
 }
 #endif
 

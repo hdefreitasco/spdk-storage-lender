@@ -540,7 +540,7 @@ int
 spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, uint64_t *iova, size_t len)
 {
 	struct spdk_mem_map *map;
-	int rc;
+	int rc = -ENOTSUP;
 
 	if (len == 0) {
 		return 0;
@@ -559,14 +559,14 @@ spdk_mem_register_dma_buf(int dma_buf, uint64_t offset, uint64_t *iova, size_t l
 	}
 
 	pthread_mutex_unlock(&g_spdk_mem_map_mutex);
-	return 0;
+	return rc;
 }
 
 int
 spdk_mem_unregister_dma_buf(uint64_t iova, size_t len)
 {
 	struct spdk_mem_map *map;
-	int rc;
+	int rc = -ENOTSUP;
 
 	if (len == 0) {
 		return 0;
@@ -585,7 +585,7 @@ spdk_mem_unregister_dma_buf(uint64_t iova, size_t len)
 	}
 
 	pthread_mutex_unlock(&g_spdk_mem_map_mutex);
-	return 0;
+	return rc;
 }
 
 static int
